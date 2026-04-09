@@ -10,6 +10,9 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime"
+	bedrockruntimeTypes "github.com/aws/aws-sdk-go-v2/service/bedrockruntime/types"
 )
 
 type AwsClaudeRequest struct {
@@ -142,4 +145,99 @@ func parseStopSequences(stop any) []string {
 		return sequences
 	}
 	return nil
+}
+
+// convertToConverseMessages converts OpenAI messages to Bedrock Converse format.
+// System messages are extracted as separate system blocks.
+func convertToConverseMessages(messages []dto.Message) ([]bedrockruntimeTypes.Message, []bedrockruntimeTypes.SystemContentBlock) {
+	var converseMessages []bedrockruntimeTypes.Message
+	var systemBlocks []bedrockruntimeTypes.SystemContentBlock
+
+	for _, msg := range messages {
+		if msg.Role == "system" {
+			systemBlocks = append(systemBlocks, &bedrockruntimeTypes.SystemContentBlockMemberText{
+				Value: msg.StringContent(),
+			})
+			continue
+		}
+
+		role := bedrockruntimeTypes.ConversationRoleUser
+		if msg.Role == "assistant" {
+			role = bedrockruntimeTypes.ConversationRoleAssistant
+		}
+
+		converseMessages = append(converseMessages, bedrockruntimeTypes.Message{
+			Role: role,
+			Content: []bedrockruntimeTypes.ContentBlock{
+				&bedrockruntimeTypes.ContentBlockMemberText{
+					Value: msg.StringContent(),
+				},
+			},
+		})
+	}
+	return converseMessages, systemBlocks
+}
+
+func buildConverseInferenceConfig(req *dto.GeneralOpenAIRequest) *bedrockruntimeTypes.InferenceConfiguration {
+	config := &bedrockruntimeTypes.InferenceConfiguration{}
+	hasConfig := false
+
+	if req.MaxTokens != nil && *req.MaxTokens > 0 {
+		maxTokens := int32(*req.MaxTokens)
+		config.MaxTokens = &maxTokens
+		hasConfig = true
+	}
+	if req.Temperature != nil {
+		temp := float32(*req.Temperature)
+		config.Temperature = &temp
+		hasConfig = true
+	}
+	if req.TopP != nil {
+		topP := float32(*req.TopP)
+		config.TopP = &topP
+		hasConfig = true
+	}
+	if req.Stop != nil {
+		if stops := parseStopSequences(req.Stop); len(stops) > 0 {
+			config.StopSequences = stops
+			hasConfig = true
+		}
+	}
+
+	if !hasConfig {
+		return nil
+	}
+	return config
+}
+
+// convertToConverseInput builds a Bedrock ConverseInput from an OpenAI chat request.
+func convertToConverseInput(modelId string, req *dto.GeneralOpenAIRequest) *bedrockruntime.ConverseInput {
+	messages, systemBlocks := convertToConverseMessages(req.Messages)
+	input := &bedrockruntime.ConverseInput{
+		ModelId:  aws.String(modelId),
+		Messages: messages,
+	}
+	if len(systemBlocks) > 0 {
+		input.System = systemBlocks
+	}
+	if config := buildConverseInferenceConfig(req); config != nil {
+		input.InferenceConfig = config
+	}
+	return input
+}
+
+// convertToConverseStreamInput builds a Bedrock ConverseStreamInput from an OpenAI chat request.
+func convertToConverseStreamInput(modelId string, req *dto.GeneralOpenAIRequest) *bedrockruntime.ConverseStreamInput {
+	messages, systemBlocks := convertToConverseMessages(req.Messages)
+	input := &bedrockruntime.ConverseStreamInput{
+		ModelId:  aws.String(modelId),
+		Messages: messages,
+	}
+	if len(systemBlocks) > 0 {
+		input.System = systemBlocks
+	}
+	if config := buildConverseInferenceConfig(req); config != nil {
+		input.InferenceConfig = config
+	}
+	return input
 }

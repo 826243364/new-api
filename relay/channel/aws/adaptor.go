@@ -31,6 +31,7 @@ type Adaptor struct {
 	AwsModelId string
 	AwsReq     any
 	IsNova     bool
+	IsConverse bool
 }
 
 func (a *Adaptor) ConvertGeminiRequest(*gin.Context, *relaycommon.RelayInfo, *dto.GeminiChatRequest) (any, error) {
@@ -115,14 +116,18 @@ func (a *Adaptor) ConvertOpenAIRequest(c *gin.Context, info *relaycommon.RelayIn
 	if request == nil {
 		return nil, errors.New("request is nil")
 	}
-	// 检查是否为Nova模型
+	// Nova models use InvokeModel with Nova-specific format
 	if isNovaModel(request.Model) {
 		novaReq := convertToNovaRequest(request)
 		a.IsNova = true
 		return novaReq, nil
 	}
-
-	// 原有的Claude模型处理逻辑
+	// Non-Claude, non-Nova models use the Bedrock Converse API
+	if isConverseModel(request.Model) {
+		a.IsConverse = true
+		return request, nil
+	}
+	// Claude models use InvokeModel with Claude-specific format
 	claudeReq, err := claude.RequestOpenAI2ClaudeMessage(c, *request)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to convert openai request to claude request")
@@ -160,6 +165,12 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 	} else {
 		if a.IsNova {
 			err, usage = handleNovaRequest(c, info, a)
+		} else if a.IsConverse {
+			if info.IsStream {
+				err, usage = converseStreamHandler(c, info, a)
+			} else {
+				err, usage = converseHandler(c, info, a)
+			}
 		} else {
 			if info.IsStream {
 				err, usage = awsStreamHandler(c, info, a)

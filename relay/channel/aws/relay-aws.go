@@ -136,6 +136,17 @@ func doAwsClientRequest(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor,
 		awsReq.Body = reqBody
 		a.AwsReq = awsReq
 		return nil, nil
+	} else if a.IsConverse {
+		var openaiReq dto.GeneralOpenAIRequest
+		if err = common.DecodeJson(requestBody, &openaiReq); err != nil {
+			return nil, types.NewError(errors.Wrap(err, "decode openai request fail"), types.ErrorCodeBadRequestBody)
+		}
+		if info.IsStream {
+			a.AwsReq = convertToConverseStreamInput(awsModelId, &openaiReq)
+		} else {
+			a.AwsReq = convertToConverseInput(awsModelId, &openaiReq)
+		}
+		return nil, nil
 	} else {
 		awsClaudeReq, err := formatRequest(requestBody, requestHeader)
 		if err != nil {
@@ -348,4 +359,147 @@ func handleNovaRequest(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) 
 
 	c.JSON(http.StatusOK, response)
 	return nil, &response.Usage
+}
+
+// converseStopReasonToOpenAI maps Bedrock Converse stop reasons to OpenAI finish_reason values.
+func converseStopReasonToOpenAI(reason bedrockruntimeTypes.StopReason) string {
+	switch reason {
+	case bedrockruntimeTypes.StopReasonMaxTokens:
+		return "length"
+	case bedrockruntimeTypes.StopReasonToolUse:
+		return "tool_calls"
+	default:
+		return "stop"
+	}
+}
+
+// converseHandler handles non-streaming responses from the Bedrock Converse API.
+func converseHandler(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) (*types.NewAPIError, *dto.Usage) {
+	ctx, cancel := newAwsInvokeContext()
+	defer cancel()
+
+	resp, err := a.AwsClient.Converse(ctx, a.AwsReq.(*bedrockruntime.ConverseInput))
+	if err != nil {
+		statusCode := getAwsErrorStatusCode(err)
+		return types.NewOpenAIError(errors.Wrap(err, "Converse"), types.ErrorCodeAwsInvokeError, statusCode), nil
+	}
+
+	var responseText string
+	if output, ok := resp.Output.(*bedrockruntimeTypes.ConverseOutputMemberMessage); ok {
+		for _, block := range output.Value.Content {
+			if text, ok := block.(*bedrockruntimeTypes.ContentBlockMemberText); ok {
+				responseText += text.Value
+			}
+		}
+	}
+
+	finishReason := converseStopReasonToOpenAI(resp.StopReason)
+	usage := &dto.Usage{}
+	if resp.Usage != nil {
+		usage.PromptTokens = int(aws.ToInt32(resp.Usage.InputTokens))
+		usage.CompletionTokens = int(aws.ToInt32(resp.Usage.OutputTokens))
+		usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+	}
+
+	response := dto.OpenAITextResponse{
+		Id:      helper.GetResponseID(c),
+		Object:  "chat.completion",
+		Created: common.GetTimestamp(),
+		Model:   info.UpstreamModelName,
+		Choices: []dto.OpenAITextResponseChoice{{
+			Index: 0,
+			Message: dto.Message{
+				Role:    "assistant",
+				Content: responseText,
+			},
+			FinishReason: finishReason,
+		}},
+		Usage: *usage,
+	}
+
+	c.JSON(http.StatusOK, response)
+	return nil, usage
+}
+
+// converseStreamHandler handles streaming responses from the Bedrock Converse API.
+func converseStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) (*types.NewAPIError, *dto.Usage) {
+	ctx, cancel := newAwsInvokeContext()
+	defer cancel()
+
+	resp, err := a.AwsClient.ConverseStream(ctx, a.AwsReq.(*bedrockruntime.ConverseStreamInput))
+	if err != nil {
+		statusCode := getAwsErrorStatusCode(err)
+		return types.NewOpenAIError(errors.Wrap(err, "ConverseStream"), types.ErrorCodeAwsInvokeError, statusCode), nil
+	}
+	stream := resp.GetStream()
+	defer stream.Close()
+
+	helper.SetEventStreamHeaders(c)
+	responseId := helper.GetResponseID(c)
+	created := common.GetTimestamp()
+	usage := &dto.Usage{}
+	firstChunkSent := false
+
+	for event := range stream.Events() {
+		switch v := event.(type) {
+		case *bedrockruntimeTypes.ConverseStreamOutputMemberContentBlockDelta:
+			info.SetFirstResponseTime()
+			textDelta, ok := v.Value.Delta.(*bedrockruntimeTypes.ContentBlockDeltaMemberText)
+			if !ok {
+				continue
+			}
+			if !firstChunkSent {
+				// Send initial chunk with role set
+				roleChunk := dto.ChatCompletionsStreamResponse{
+					Id:      responseId,
+					Object:  "chat.completion.chunk",
+					Created: created,
+					Model:   info.UpstreamModelName,
+					Choices: []dto.ChatCompletionsStreamResponseChoice{{
+						Index: 0,
+						Delta: dto.ChatCompletionsStreamResponseChoiceDelta{Role: "assistant"},
+					}},
+				}
+				_ = helper.ObjectData(c, roleChunk)
+				firstChunkSent = true
+			}
+			chunk := dto.ChatCompletionsStreamResponse{
+				Id:      responseId,
+				Object:  "chat.completion.chunk",
+				Created: created,
+				Model:   info.UpstreamModelName,
+				Choices: []dto.ChatCompletionsStreamResponseChoice{{
+					Index: 0,
+					Delta: dto.ChatCompletionsStreamResponseChoiceDelta{},
+				}},
+			}
+			chunk.Choices[0].Delta.SetContentString(textDelta.Value)
+			_ = helper.ObjectData(c, chunk)
+
+		case *bedrockruntimeTypes.ConverseStreamOutputMemberMetadata:
+			if v.Value.Usage != nil {
+				usage.PromptTokens = int(aws.ToInt32(v.Value.Usage.InputTokens))
+				usage.CompletionTokens = int(aws.ToInt32(v.Value.Usage.OutputTokens))
+				usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+			}
+
+		case *bedrockruntimeTypes.ConverseStreamOutputMemberMessageStop:
+			finishReason := converseStopReasonToOpenAI(v.Value.StopReason)
+			finalChunk := dto.ChatCompletionsStreamResponse{
+				Id:      responseId,
+				Object:  "chat.completion.chunk",
+				Created: created,
+				Model:   info.UpstreamModelName,
+				Choices: []dto.ChatCompletionsStreamResponseChoice{{
+					Index:        0,
+					Delta:        dto.ChatCompletionsStreamResponseChoiceDelta{},
+					FinishReason: &finishReason,
+				}},
+			}
+			_ = helper.ObjectData(c, finalChunk)
+		}
+	}
+
+	helper.Done(c)
+	return nil, usage
 }
